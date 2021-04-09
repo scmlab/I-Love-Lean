@@ -3,8 +3,6 @@ import init.Data.Array
 open Lean Lean.Meta Lean.Core Lean.Elab Lean.Elab.Term 
 open Lean.Elab.Command
 
-syntax (name := applicative) "{| " term* " |}" : term
-
 private def saveContext : TermElabM SavedContext :=
   return {
     macroStack := (← read).macroStack
@@ -34,8 +32,7 @@ private def elabUsingElabFnsAux (s : SavedState) (stx : Syntax) (expectedType? :
   | []                => do throwError "unexpected syntax{indentD stx}"
   | (elabFn::elabFns) => do
     try
-      let expr ← elabFn stx expectedType?
-      return expr
+      elabFn stx expectedType?
     catch ex => match ex with
       | Exception.error _ _ =>
         if (← read).errToSorry then
@@ -90,19 +87,19 @@ def elabApplicativeExpr (e : Expr) : TermElabM (Expr × Expr) := do
   | some (m, α) => return (m, α)
   | none => throwError "{e} is not an applicative functor."
 
-def ensureHasTypeApplicative (expectedApplicative : Expr) (e : Expr) : TermElabM (Expr × Expr) := do
-  let (meType, αeType) ← elabApplicativeExpr (← inferType e)
-  let _ ← ensureHasTypeAux (some expectedApplicative) meType e
-  return (meType, αeType)
-
-def mkFType (t : Expr) (b : Expr) : Expr :=
-  mkForall Name.anonymous BinderInfo.default t b
+def ensureHasTypeApplicative (expectedApplicative : Expr) (e : Syntax) (catchExPostpone : Bool) : TermElabM (Expr × Expr) := do
+  let e ← elabUsingElabFns e none catchExPostpone 
+  let eType ← inferType e
+  let eType ← ensureHasTypeAux (some (mkApp expectedApplicative (← mkFreshTypeMVar))) eType eType
+  elabApplicativeExpr eType
 
 def insertApplicative (f : Syntax) (args : Array Syntax) : TermElabM Syntax := do
   let mut g ← `(pure $f)
   for arg in args do
     g ← `(Seq.seq $g $arg) 
   return g
+
+syntax (name := applicative) "{| " term* " |}" : term
 
 partial def testAppAux (expectedType? : Option Expr) (catchExPostpone : Bool) (implicitLambda : Bool): Syntax → TermElabM Expr
   | `({| $stx |}) => withFreshMacroScope $ withIncRecDepth do
@@ -117,32 +114,42 @@ partial def testAppAux (expectedType? : Option Expr) (catchExPostpone : Bool) (i
       match stxNew? with
       | some stxNew => 
         withMacroExpansion stx stxNew $ testAppAux expectedType? catchExPostpone implicitLambda (← `({| $stxNew |}))
-      -- No macro
+      -- If no macro
       | none => 
         match stx with
         | `($f $args*) => do
           match expectedType? with
           | some expectedType => do
             let (expectedApplicative, expectedArg) ← elabApplicativeExpr expectedType
-            let argArgs ← Array.mapM (λ arg => do 
-                let arg ← elabUsingElabFns arg none catchExPostpone
-                let (_, argArg) ← ensureHasTypeApplicative expectedApplicative arg
-                return argArg
+            let argArgs ← Array.mapM (λ arg => 
+                  Prod.snd <$> ensureHasTypeApplicative expectedApplicative arg catchExPostpone
               ) args
-            let fTypeExpectedType := Array.foldr mkFType expectedArg argArgs
-            let _ ← ensureHasType (some fTypeExpectedType) (← elabUsingElabFns f none catchExPostpone)
-            elabTerm (← insertApplicative f args) expectedType?
+            let fExpectedType ← Array.foldrM (λ e1 e2 => liftMetaM $ mkArrow e1 e2) expectedArg argArgs
+            let _ ← ensureHasType (some fExpectedType) (← elabUsingElabFns f none catchExPostpone)
+            elabTermEnsuringType (← insertApplicative f args) expectedType?
+          | none => throwError "missing expectedType"
+        | `($f) => do
+          match expectedType? with
+          | some expectedType => do
+            let (expectedApplicative, expectedF) ← elabApplicativeExpr expectedType
+            let fApp ← elabUsingElabFns (← insertApplicative f Array.empty) none catchExPostpone
+            let f ← elabUsingElabFns f none catchExPostpone
+            let fType ← inferType f
+            let _ ← ensureHasTypeAux expectedF fType f
+            ensureHasType (some (mkApp expectedApplicative fType)) fApp
           | none => throwError "missing expectedType"
         | _ => throwUnsupportedSyntax
+       
   | _ => throwUnsupportedSyntax
 
-@[termElab applicative] def testApp : TermElab := λ stx expectedType? =>
+@[termElab applicative] partial def testApp : TermElab := λ stx expectedType? =>
   withInfoContext' (withRef stx <| testAppAux expectedType? true true stx) (mkTermInfo stx)
 
 def add (a b : Int) : Int := a + b
 def hello : IO String := return "Hello"
 def world : IO String := return "World"
-def testMain₁ : IO String := {| hello ++ world |}
+def testMain₁ : IO Int := {| (add 1 2)  |}
 
 #check testMain₁
-
+#eval testMain₁
+#check Prod.snd
