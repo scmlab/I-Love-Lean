@@ -3,63 +3,6 @@ import init.Data.Array
 open Lean Lean.Meta Lean.Core Lean.Elab Lean.Elab.Term 
 open Lean.Elab.Command
 
-private def saveContext : TermElabM SavedContext :=
-  return {
-    macroStack := (← read).macroStack
-    declName?  := (← read).declName?
-    options    := (← getOptions)
-    openDecls  := (← getOpenDecls)
-    errToSorry := (← read).errToSorry
-  }
-
-private def postponeElabTerm (stx : Syntax) (expectedType? : Option Expr) : TermElabM Expr := do
-  trace[Elab.postpone] "{stx} : {expectedType?}"
-  let mvar ← mkFreshExprMVar expectedType? MetavarKind.syntheticOpaque
-  let ctx ← read
-  registerSyntheticMVar stx mvar.mvarId! (SyntheticMVarKind.postponed (← saveContext))
-  pure mvar
-
-private def exceptionToSorry (ex : Exception) (expectedType? : Option Expr) : TermElabM Expr := do
-  let expectedType ← match expectedType? with
-    | none              => mkFreshTypeMVar
-    | some expectedType => pure expectedType
-  let syntheticSorry ← mkSyntheticSorry expectedType
-  logException ex
-  pure syntheticSorry
-
-private def elabUsingElabFnsAux (s : SavedState) (stx : Syntax) (expectedType? : Option Expr) (catchExPostpone : Bool)
-    : List TermElab → TermElabM Expr
-  | []                => do throwError "unexpected syntax{indentD stx}"
-  | (elabFn::elabFns) => do
-    try
-      elabFn stx expectedType?
-    catch ex => match ex with
-      | Exception.error _ _ =>
-        if (← read).errToSorry then
-          exceptionToSorry ex expectedType?
-        else
-          throw ex
-      | Exception.internal id _ =>
-        if (← read).errToSorry && id == abortTermExceptionId then
-          exceptionToSorry ex expectedType?
-        else if id == unsupportedSyntaxExceptionId then
-          s.restore
-          elabUsingElabFnsAux s stx expectedType? catchExPostpone elabFns
-        else if catchExPostpone && id == postponeExceptionId then
-            s.restore
-            postponeElabTerm stx expectedType?
-          else
-            throw ex
-
-private def elabUsingElabFns (stx : Syntax) (expectedType? : Option Expr) (catchExPostpone : Bool) : TermElabM Expr := do
-  let s ← saveAllState
-  let table := termElabAttribute.ext.getState (← getEnv) |>.table
-  let k := stx.getKind
-  match table.find? k with
-  | some elabFns => do
-      elabUsingElabFnsAux s stx expectedType? catchExPostpone elabFns
-  | none         => throwError "elaboration function for '{k}' has not been implemented{indentD stx}"
-
 def isApplicative? (m : Expr) : MetaM (Option Expr) :=
   try
     let applicativeType ← mkAppM `Applicative #[m]
@@ -87,8 +30,8 @@ def elabApplicativeExpr (e : Expr) : TermElabM (Expr × Expr) := do
   | some (m, α) => return (m, α)
   | none => throwError "{e} is not an applicative functor."
 
-def ensureHasTypeApplicative (expectedApplicative : Expr) (e : Syntax) (catchExPostpone : Bool) : TermElabM (Expr × Expr) := do
-  let e ← elabUsingElabFns e none catchExPostpone 
+def ensureHasTypeApplicative (expectedApplicative : Expr) (e : Syntax) : TermElabM (Expr × Expr) := do
+  let e ← elabTerm e none 
   let eType ← inferType e
   let eType ← ensureHasTypeAux (some (mkApp expectedApplicative (← mkFreshTypeMVar))) eType eType
   elabApplicativeExpr eType
@@ -122,18 +65,18 @@ partial def testAppAux (expectedType? : Option Expr) (catchExPostpone : Bool) (i
           | some expectedType => do
             let (expectedApplicative, expectedArg) ← elabApplicativeExpr expectedType
             let argArgs ← Array.mapM (λ arg => 
-                  Prod.snd <$> ensureHasTypeApplicative expectedApplicative arg catchExPostpone
+                  Prod.snd <$> ensureHasTypeApplicative expectedApplicative arg
               ) args
             let fExpectedType ← Array.foldrM (λ e1 e2 => liftMetaM $ mkArrow e1 e2) expectedArg argArgs
-            let _ ← ensureHasType (some fExpectedType) (← elabUsingElabFns f none catchExPostpone)
+            let _ ← ensureHasType (some fExpectedType) (← elabTerm f none)
             elabTermEnsuringType (← insertApplicative f args) expectedType?
           | none => throwError "missing expectedType"
         | `($f) => do
           match expectedType? with
           | some expectedType => do
             let (expectedApplicative, expectedF) ← elabApplicativeExpr expectedType
-            let fApp ← elabUsingElabFns (← insertApplicative f Array.empty) none catchExPostpone
-            let f ← elabUsingElabFns f none catchExPostpone
+            let fApp ← elabTerm (← insertApplicative f Array.empty) none
+            let f ← elabTerm f none 
             let fType ← inferType f
             let _ ← ensureHasTypeAux expectedF fType f
             ensureHasType (some (mkApp expectedApplicative fType)) fApp
